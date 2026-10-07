@@ -15,6 +15,14 @@ from . import register
 REDACTED = "[redacted]"
 
 
+class RedactionCollision(ValueError):
+    """Two distinct record keys would become the same key after redaction.
+
+    The export is refused instead of letting one value overwrite the
+    other. The message never contains the secret.
+    """
+
+
 @register("privacy", "redact.v1")
 class FieldRedaction:
     """Replaces declared field names with a marker in any nested record."""
@@ -42,7 +50,7 @@ class FieldRedaction:
 
 @register("privacy", "redact.values.v1")
 class ValueRedaction(FieldRedaction):
-    """Also removes declared secret text values wherever they are copied."""
+    """Also removes declared secret text values from strings and keys."""
 
     MIN_SECRET_CHARS = 8
 
@@ -67,4 +75,17 @@ class ValueRedaction(FieldRedaction):
             for secret in self.secrets:
                 obj = obj.replace(secret, REDACTED)
             return obj
+        if isinstance(obj, dict):
+            # Keys are scrubbed like values. If two distinct keys would
+            # become one, the export is refused rather than letting one
+            # value silently overwrite the other.
+            out: dict[Any, Any] = {}
+            for k, v in obj.items():
+                key = self._scrub(k) if isinstance(k, str) else k
+                if key in out:
+                    raise RedactionCollision(
+                        "two keys in an exported record collide after"
+                        " value redaction")
+                out[key] = REDACTED if k in self.fields else self._scrub(v)
+            return out
         return super()._scrub(obj)

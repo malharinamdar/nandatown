@@ -12,12 +12,36 @@ import os
 import pytest
 
 from nandatown.bundle import verify_bundle
+from nandatown.cli import main
+from nandatown.layers.privacy import RedactionCollision
 from nandatown.records import TownEvent
+from nandatown.sim import agents as sim_agents
 from nandatown.sim.runner import build_engine, run_lab
 from nandatown.sim.scenario import load_bundled
 from nandatown.sim.validators import evaluate_scenario
 
 KEY = "nt-canary-3f9a1c0b7e2d4a65"
+
+
+class KeyChattyBuyer(sim_agents.ChattyBuyer):
+    """Test-only: also uses its key as a JSON key, top-level and nested."""
+
+    def quote_request_body(self):
+        body = super().quote_request_body()
+        key = self.config["api_key"]
+        body[key] = "as a key"
+        body["meta"] = {"seen": {f"my {key}": 1}}
+        return body
+
+
+class CollidingChattyBuyer(sim_agents.ChattyBuyer):
+    """Test-only: a key that becomes '[redacted]' next to a literal one."""
+
+    def quote_request_body(self):
+        body = super().quote_request_body()
+        body[self.config["api_key"]] = 1
+        body["[redacted]"] = 2
+        return body
 
 
 def statuses(result):
@@ -66,6 +90,22 @@ def test_value_rule_scrubs_the_key_inside_text_only():
     assert privacy.redact(record) == {
         "note": "my key is [redacted], use it", "api_key": "[redacted]",
         "quantity": 2, "sku": "widget"}
+
+
+def test_value_rule_scrubs_the_key_when_used_as_a_nested_dict_key():
+    engine = build_engine(load_bundled("secret_leak"))
+    privacy = engine.layers["privacy"]
+    record = {KEY: 1, "nested": [{"x": {f"my {KEY}": "v"}}]}
+    assert privacy.redact(record) == {
+        "[redacted]": 1, "nested": [{"x": {"my [redacted]": "v"}}]}
+
+
+def test_value_rule_refuses_keys_that_collide_after_redaction():
+    engine = build_engine(load_bundled("secret_leak"))
+    privacy = engine.layers["privacy"]
+    with pytest.raises(RedactionCollision) as caught:
+        privacy.redact({"outer": {KEY: 1, "[redacted]": 2}})
+    assert KEY not in str(caught.value)
 
 
 def test_value_rule_leaves_numbers_and_short_strings_name_only():
@@ -119,3 +159,50 @@ def test_a_canary_planted_in_a_passing_trace_fails():
     tampered = events[:-1] + [planted]
     assert statuses(evaluate_scenario(spec, "r", tampered))[
         "secret_withheld"] == "failed"
+
+
+def test_full_run_keeps_a_key_used_as_a_json_key_out_of_every_file(
+        tmp_path, monkeypatch):
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer", KeyChattyBuyer)
+    bundle_dir, result = run_lab("secret_leak", str(tmp_path))
+    assert result.verdict == "passed", statuses(result)
+    assert files_containing(bundle_dir, KEY) == []
+    assert verify_bundle(bundle_dir) == []
+
+
+def test_full_run_on_name_only_rule_exports_the_key_used_as_a_json_key(
+        tmp_path, monkeypatch):
+    # Control: the test agent really puts the key into exported keys.
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer", KeyChattyBuyer)
+    bundle_dir, result = run_lab("secret_leak", str(tmp_path),
+                                 layer_overrides={"privacy": "redact.v1"})
+    assert statuses(result)["secret_withheld"] == "failed"
+    assert files_containing(bundle_dir, KEY) == ["events.jsonl",
+                                                 "intents.jsonl"]
+
+
+def test_full_run_refuses_a_key_collision_and_writes_no_bundle(
+        tmp_path, monkeypatch):
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer",
+                        CollidingChattyBuyer)
+    out = tmp_path / "out"
+    with pytest.raises(RedactionCollision):
+        run_lab("secret_leak", str(out))
+    assert not out.exists() or list(out.iterdir()) == []
+
+
+def test_cli_run_and_compare_report_a_collision_as_a_refusal(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer",
+                        CollidingChattyBuyer)
+    out = tmp_path / "out"
+    assert main(["run", "secret_leak", "--out", str(out)]) == 1
+    printed = capsys.readouterr().out
+    assert "run refused" in printed and "no bundle was written" in printed
+    assert not out.exists() or list(out.iterdir()) == []
+
+    assert main(["compare", "secret_leak", "--swap", "privacy=redact.v1",
+                 "--out", str(tmp_path / "cmp")]) == 1
+    printed += capsys.readouterr().out
+    assert "comparison refused" in printed
+    assert KEY not in printed
