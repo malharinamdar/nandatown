@@ -60,15 +60,24 @@ class ValueRedaction(FieldRedaction):
 
     def configure(self, fields: list[str]) -> None:
         super().configure(fields)
-        found = {
-            value
-            for agent in self.engine.spec.agents
-            for key, value in agent.config.items()
-            if key in self.fields and isinstance(value, str)
-            and len(value) >= self.MIN_SECRET_CHARS
-        }
+        found: set[str] = set()
+        for agent in self.engine.spec.agents:
+            self._collect(agent.config, False, found)
         # Longest first, so a secret that contains another is removed whole.
         self.secrets = sorted(found, key=lambda s: (-len(s), s))
+
+    def _collect(self, obj: Any, declared: bool, found: set[str]) -> None:
+        """Text inside a declared field, at any depth, as the name rule
+        matches declared fields at any depth."""
+        if isinstance(obj, str):
+            if declared and len(obj) >= self.MIN_SECRET_CHARS:
+                found.add(obj)
+        elif isinstance(obj, dict):
+            for key, value in obj.items():
+                self._collect(value, declared or key in self.fields, found)
+        elif isinstance(obj, (list, tuple)):
+            for value in obj:
+                self._collect(value, declared, found)
 
     def _scrub(self, obj: Any) -> Any:
         if isinstance(obj, str):

@@ -88,7 +88,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                   " the scripted reference agents")
             return 2
         from .layers.privacy import RedactionCollision
-        from .sim.runner import run_lab
+        from .sim.runner import UnsupportedValue, run_lab
         print(f"nandatown {__version__}: Lab run of {name}"
               " (deterministic, no model, no tokens)")
         try:
@@ -96,7 +96,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                                          plugins=args.plugin or None,
                                          layer_overrides=layer_overrides
                                          or None)
-        except RedactionCollision as exc:
+        except (RedactionCollision, UnsupportedValue) as exc:
             print(f"run refused: {exc}; no bundle was written")
             return 1
     else:
@@ -462,12 +462,13 @@ def cmd_compare(args: argparse.Namespace) -> int:
               " against the baseline")
         return 2
     from .layers.privacy import RedactionCollision
+    from .sim.runner import UnsupportedValue
 
     try:
         compare_dir, comparison = run_comparison(
             args.target, swaps, args.out, seed=args.seed,
             plugins=args.plugin or None)
-    except RedactionCollision as exc:
+    except (RedactionCollision, UnsupportedValue) as exc:
         print(f"comparison refused: {exc}; the refused run wrote no bundle")
         return 1
     with open(f"{compare_dir}/comparison.md") as f:

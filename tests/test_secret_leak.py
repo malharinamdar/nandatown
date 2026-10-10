@@ -10,13 +10,14 @@ secrets in exported events.
 import os
 
 import pytest
+import yaml
 
 from nandatown.bundle import verify_bundle
 from nandatown.cli import main
 from nandatown.layers.privacy import RedactionCollision
 from nandatown.records import TownEvent
 from nandatown.sim import agents as sim_agents
-from nandatown.sim.runner import build_engine, run_lab
+from nandatown.sim.runner import UnsupportedValue, build_engine, run_lab
 from nandatown.sim.scenario import load_bundled
 from nandatown.sim.validators import evaluate_scenario
 
@@ -42,6 +43,40 @@ class CollidingChattyBuyer(sim_agents.ChattyBuyer):
         body[self.config["api_key"]] = 1
         body["[redacted]"] = 2
         return body
+
+
+class TupleChattyBuyer(sim_agents.ChattyBuyer):
+    """Test-only: also sends its key inside a tuple, and observes one."""
+
+    def quote_request_body(self):
+        key = self.config["api_key"]
+        self.api.observe("key_kept", self.name,
+                         {"keys": (key, ("nested", key))})
+        return dict(super().quote_request_body(), keys=(key,))
+
+
+class OddValueChattyBuyer(sim_agents.ChattyBuyer):
+    """Test-only: observes a value built from its key that JSON cannot
+    hold exactly. Observations skip message signing, so the value
+    reaches the export path."""
+
+    odd = None
+
+    def quote_request_body(self):
+        self.api.observe("odd_value", self.name,
+                         {"value": self.odd(self.config["api_key"])})
+        return super().quote_request_body()
+
+
+class NestedChattyBuyer(sim_agents.ChattyBuyer):
+    """Test-only: its key is declared one level down, under credentials."""
+
+    def quote_request_body(self):
+        self.api.observe("secret_shared", self.name,
+                         {"field": "api_key", "in_kind": "quote_request"})
+        key = self.config["credentials"]["api_key"]
+        return dict(sim_agents.Buyer.quote_request_body(self),
+                    note=f"my key is {key}")
 
 
 def statuses(result):
@@ -206,3 +241,159 @@ def test_cli_run_and_compare_report_a_collision_as_a_refusal(
     printed += capsys.readouterr().out
     assert "comparison refused" in printed
     assert KEY not in printed
+
+
+def write_scenario(directory, change):
+    """secret_leak as a YAML file, changed by change(data)."""
+    data = load_bundled("secret_leak").model_dump()
+    change(data)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "scenario.yaml"
+    path.write_text(yaml.safe_dump(data))
+    return str(path)
+
+
+def name_buyer_after_key(data):
+    for agent in data["agents"]:
+        if agent["role"] == "chatty_buyer":
+            agent["name"] = KEY
+
+
+KEY_IN_RUN_METADATA = {
+    "agent name": lambda d: write_scenario(d, name_buyer_after_key),
+    "scenario name": lambda d: write_scenario(
+        d, lambda data: data.update(name=KEY)),
+    "scenario path": lambda d: write_scenario(d / KEY, lambda data: None),
+}
+
+
+@pytest.mark.parametrize("where", sorted(KEY_IN_RUN_METADATA))
+def test_full_run_keeps_a_key_in_run_metadata_out_of_every_file(
+        tmp_path, where):
+    scenario = KEY_IN_RUN_METADATA[where](tmp_path / "in")
+    bundle_dir, result = run_lab(scenario, str(tmp_path / "out"))
+    assert result.verdict == "passed", statuses(result)
+    assert statuses(result)["leak_attempted"] == "passed"
+    assert main(["visualize", bundle_dir]) == 0
+    assert main(["receipt", bundle_dir]) == 0
+    assert files_containing(bundle_dir, KEY) == []
+    assert verify_bundle(bundle_dir) == []
+
+
+def test_full_run_on_name_only_rule_exports_a_key_in_the_agent_name(
+        tmp_path):
+    # Control: the agent name really carries the key into run metadata.
+    scenario = write_scenario(tmp_path / "in", name_buyer_after_key)
+    bundle_dir, result = run_lab(scenario, str(tmp_path / "out"),
+                                 layer_overrides={"privacy": "redact.v1"})
+    assert statuses(result)["secret_withheld"] == "failed"
+    hits = files_containing(bundle_dir, KEY)
+    assert "run.json" in hits and "report.md" in hits
+    assert verify_bundle(bundle_dir) == []
+
+
+def test_full_run_keeps_a_key_in_a_tuple_out_of_every_file(
+        tmp_path, monkeypatch):
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer", TupleChattyBuyer)
+    bundle_dir, result = run_lab("secret_leak", str(tmp_path))
+    assert result.verdict == "passed", statuses(result)
+    assert files_containing(bundle_dir, KEY) == []
+    assert verify_bundle(bundle_dir) == []
+
+
+def test_full_run_on_name_only_rule_judges_a_tuple_as_exported(
+        tmp_path, monkeypatch):
+    # Control: the tuple reaches both files, and the recorded result is
+    # the one a replay of those files gives.
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer", TupleChattyBuyer)
+    bundle_dir, result = run_lab("secret_leak", str(tmp_path),
+                                 layer_overrides={"privacy": "redact.v1"})
+    assert statuses(result)["secret_withheld"] == "failed"
+    assert files_containing(bundle_dir, KEY) == ["events.jsonl",
+                                                 "intents.jsonl"]
+    assert verify_bundle(bundle_dir) == []
+
+
+ODD_VALUES = {
+    "set": lambda key: {key},
+    "bytes": lambda key: key.encode(),
+    "nan": lambda key: float("nan"),
+    "infinity": lambda key: float("inf"),
+    "int key": lambda key: {1: key},
+}
+
+
+@pytest.mark.parametrize("kind", sorted(ODD_VALUES))
+def test_full_run_refuses_a_value_json_cannot_hold_and_writes_no_bundle(
+        tmp_path, monkeypatch, kind):
+    role = type("OddBuyer", (OddValueChattyBuyer,),
+                {"odd": staticmethod(ODD_VALUES[kind])})
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer", role)
+    out = tmp_path / "out"
+    with pytest.raises(UnsupportedValue) as caught:
+        run_lab("secret_leak", str(out))
+    assert KEY not in str(caught.value)
+    assert not out.exists() or list(out.iterdir()) == []
+
+
+def test_cli_run_and_compare_report_an_unsupported_value_as_a_refusal(
+        tmp_path, monkeypatch, capsys):
+    role = type("OddBuyer", (OddValueChattyBuyer,),
+                {"odd": staticmethod(ODD_VALUES["set"])})
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer", role)
+    out = tmp_path / "out"
+    assert main(["run", "secret_leak", "--out", str(out)]) == 1
+    printed = capsys.readouterr().out
+    assert "run refused" in printed and "no bundle was written" in printed
+    assert not out.exists() or list(out.iterdir()) == []
+
+    assert main(["compare", "secret_leak", "--swap", "privacy=redact.v1",
+                 "--out", str(tmp_path / "cmp")]) == 1
+    printed += capsys.readouterr().out
+    assert "comparison refused" in printed
+    assert KEY not in printed
+
+
+def test_full_run_refuses_participants_that_share_a_name_after_redaction(
+        tmp_path):
+    def collide(data):
+        name_buyer_after_key(data)
+        data["agents"][0]["name"] = "[redacted]"
+
+    scenario = write_scenario(tmp_path / "in", collide)
+    out = tmp_path / "out"
+    with pytest.raises(RedactionCollision) as caught:
+        run_lab(scenario, str(out))
+    assert "participants" in str(caught.value)
+    assert KEY not in str(caught.value)
+    assert not out.exists() or list(out.iterdir()) == []
+
+
+def nest_buyer_key(data):
+    for agent in data["agents"]:
+        if agent["role"] == "chatty_buyer":
+            agent["config"]["credentials"] = {
+                "api_key": agent["config"].pop("api_key")}
+
+
+def test_value_rule_finds_secrets_in_nested_declared_fields():
+    spec = load_bundled("secret_leak")
+    buyer = next(a for a in spec.agents if a.role == "chatty_buyer")
+    other = "nt-canary-0123456789abcdef"
+    config = {k: v for k, v in buyer.config.items() if k != "api_key"}
+    spec.agents[spec.agents.index(buyer)] = buyer.model_copy(update={
+        "config": dict(config, credentials={"api_key": KEY},
+                       backup={"api_key": [other]})})
+    privacy = build_engine(spec).layers["privacy"]
+    assert privacy.redact({"note": f"{KEY} and {other}"}) == {
+        "note": "[redacted] and [redacted]"}
+
+
+def test_full_run_keeps_a_nested_declared_key_out_of_every_file(
+        tmp_path, monkeypatch):
+    monkeypatch.setitem(sim_agents.ROLES, "chatty_buyer", NestedChattyBuyer)
+    scenario = write_scenario(tmp_path / "in", nest_buyer_key)
+    bundle_dir, result = run_lab(scenario, str(tmp_path / "out"))
+    assert result.verdict == "passed", statuses(result)
+    assert files_containing(bundle_dir, KEY) == []
+    assert verify_bundle(bundle_dir) == []
