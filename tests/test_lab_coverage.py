@@ -35,6 +35,10 @@ NATIVE_SCENARIO_STAGES = {
         "spoof_detected", "honest_verified", "containment",
         "honest_trade_completed",
     },
+    "capped_influence": {
+        "slander_filed", "influence_capped", "honest_signal_survives",
+        "honest_trade_completed",
+    },
     "secret_leak": {"leak_attempted", "secret_withheld", "trade_completed"},
 }
 ADAPTED_STAGES = {
@@ -126,6 +130,7 @@ def test_declared_privacy_rejects_an_unredacted_event():
     ("consensus", NATIVE_SCENARIO_STAGES["consensus"]),
     ("supply_chain", NATIVE_SCENARIO_STAGES["supply_chain"]),
     ("capability_spoofing", NATIVE_SCENARIO_STAGES["capability_spoofing"]),
+    ("capped_influence", NATIVE_SCENARIO_STAGES["capped_influence"]),
     ("secret_leak", NATIVE_SCENARIO_STAGES["secret_leak"]),
 ])
 def test_healthy_native_scenarios_emit_their_literal_stage_set(name, expected):
